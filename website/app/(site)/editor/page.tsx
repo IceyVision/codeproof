@@ -1,6 +1,6 @@
 export default function EditorPage() {
   return (
-    <div className="flex flex-col h-[calc(100vh-3.5rem)]">
+    <div className="flex flex-col h-[calc(100vh-4rem)]">
       <div className="h-10 px-6 flex items-center justify-between border-b border-black/10 dark:border-white/10 text-sm">
         <span className="text-foreground/60 font-mono">Untitled session</span>
         <div className="flex items-center gap-2">
