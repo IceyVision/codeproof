@@ -1,28 +1,42 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { EditorState, Compartment } from "@codemirror/state";
-import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { bracketMatching, foldGutter, foldKeymap, indentOnInput, indentUnit } from "@codemirror/language";
-import { javascript } from "@codemirror/lang-javascript";
-import { python } from "@codemirror/lang-python";
-import type { Extension } from "@codemirror/state";
+import { EditorState, Compartment, type Extension } from "@codemirror/state";
+import {
+  EditorView,
+  keymap,
+  lineNumbers,
+  highlightActiveLine,
+  highlightActiveLineGutter,
+  drawSelection,
+} from "@codemirror/view";
+import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+  indentWithTab,
+} from "@codemirror/commands";
+import {
+  bracketMatching,
+  foldGutter,
+  foldKeymap,
+  indentOnInput,
+  indentUnit,
+} from "@codemirror/language";
 import { THEME_CHANGE_EVENT, type Theme, getCurrentTheme } from "../_lib/theme";
 import { darkTheme, lightTheme } from "../_lib/editor-theme";
+import {
+  MAX_TABS,
+  defaultFilenameForNewTab,
+  isValidFilename,
+  languageExtensionFor,
+  newTabId,
+  type TabId,
+  type TabMeta,
+} from "../_lib/tabs";
+import { TabStrip } from "./TabStrip";
 
-type Language = "javascript" | "typescript" | "python";
-
-const LANGUAGES: { value: Language; label: string }[] = [
-  { value: "javascript", label: "JavaScript" },
-  { value: "typescript", label: "TypeScript" },
-  { value: "python", label: "Python" },
-];
-
-const DEFAULT_LANGUAGE: Language = "javascript";
-
-const STARTER_DOCS: Record<Language, string> = {
-  javascript: `// Welcome to Codeproof
+const STARTER_DOC = `// main.js — welcome to Codeproof
 // Every keystroke here will be replayable.
 
 function twoSum(nums, target) {
@@ -38,93 +52,98 @@ function twoSum(nums, target) {
 }
 
 console.log(twoSum([2, 7, 11, 15], 9));
-`,
-  typescript: `// Welcome to Codeproof
-// Every keystroke here will be replayable.
-
-function twoSum(nums: number[], target: number): [number, number] | null {
-  const seen = new Map<number, number>();
-  for (let i = 0; i < nums.length; i++) {
-    const complement = target - nums[i];
-    if (seen.has(complement)) {
-      return [seen.get(complement)!, i];
-    }
-    seen.set(nums[i], i);
-  }
-  return null;
-}
-
-console.log(twoSum([2, 7, 11, 15], 9));
-`,
-  python: `# Welcome to Codeproof
-# Every keystroke here will be replayable.
-
-def two_sum(nums, target):
-    seen = {}
-    for i, n in enumerate(nums):
-        complement = target - n
-        if complement in seen:
-            return [seen[complement], i]
-        seen[n] = i
-    return None
-
-print(two_sum([2, 7, 11, 15], 9))
-`,
-};
-
-function languageExtension(lang: Language): Extension {
-  switch (lang) {
-    case "javascript":
-      return javascript();
-    case "typescript":
-      return javascript({ typescript: true });
-    case "python":
-      return python();
-  }
-}
+`;
 
 function themeExtension(theme: Theme): Extension {
   return theme === "dark" ? darkTheme : lightTheme;
 }
 
+type Compartments = { theme: Compartment; language: Compartment };
+
+function createTabState(
+  doc: string,
+  filename: string,
+  theme: Theme,
+  comps: Compartments,
+): EditorState {
+  const lang = languageExtensionFor(filename);
+  return EditorState.create({
+    doc,
+    extensions: [
+      lineNumbers(),
+      highlightActiveLineGutter(),
+      highlightActiveLine(),
+      history(),
+      foldGutter(),
+      drawSelection(),
+      indentOnInput(),
+      bracketMatching(),
+      indentUnit.of("  "),
+      keymap.of([
+        ...defaultKeymap,
+        ...historyKeymap,
+        ...foldKeymap,
+        indentWithTab,
+      ]),
+      comps.language.of(lang ?? []),
+      comps.theme.of(themeExtension(theme)),
+      EditorView.lineWrapping,
+    ],
+  });
+}
+
+function reconcileThemeOnState(
+  state: EditorState,
+  comps: Compartments,
+  theme: Theme,
+): EditorState {
+  const tx = state.update({
+    effects: comps.theme.reconfigure(themeExtension(theme)),
+  });
+  return tx.state;
+}
+
 export function Workspace() {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
-  const themeCompartment = useRef(new Compartment());
-  const languageCompartment = useRef(new Compartment());
-  const [language, setLanguage] = useState<Language>(DEFAULT_LANGUAGE);
+  const compsRef = useRef<Compartments>({
+    theme: new Compartment(),
+    language: new Compartment(),
+  });
+  const statesRef = useRef<Map<TabId, EditorState>>(new Map());
+  const activeIdRef = useRef<TabId | null>(null);
+
+  const [tabs, setTabs] = useState<TabMeta[]>(() => [
+    { id: newTabId(), name: "main.js" },
+  ]);
+  const [activeId, setActiveId] = useState<TabId>(() => tabs[0].id);
   const [sessionName, setSessionName] = useState("Untitled session");
 
+  // Keep a ref so callbacks can read the latest active id without capturing it
+  // (avoids re-running the mount effect and keeps close-over-handler references stable).
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  // Mount the view once, with the initial tab's state.
   useEffect(() => {
     if (!hostRef.current || viewRef.current) return;
 
-    const initialTheme = getCurrentTheme();
-    const state = EditorState.create({
-      doc: STARTER_DOCS[DEFAULT_LANGUAGE],
-      extensions: [
-        lineNumbers(),
-        highlightActiveLineGutter(),
-        highlightActiveLine(),
-        history(),
-        foldGutter(),
-        drawSelection(),
-        indentOnInput(),
-        bracketMatching(),
-        indentUnit.of("  "),
-        keymap.of([...defaultKeymap, ...historyKeymap, ...foldKeymap, indentWithTab]),
-        languageCompartment.current.of(languageExtension(DEFAULT_LANGUAGE)),
-        themeCompartment.current.of(themeExtension(initialTheme)),
-        EditorView.lineWrapping,
-      ],
-    });
+    const firstTab = tabs[0];
+    const theme = getCurrentTheme();
+    const state = createTabState(STARTER_DOC, firstTab.name, theme, compsRef.current);
+    statesRef.current.set(firstTab.id, state);
 
     const view = new EditorView({ state, parent: hostRef.current });
     viewRef.current = view;
 
-    function onThemeChange(e: Event) {
-      const next = (e as CustomEvent<Theme>).detail ?? getCurrentTheme();
-      view.dispatch({
-        effects: themeCompartment.current.reconfigure(themeExtension(next)),
+    function onThemeChange() {
+      const v = viewRef.current;
+      if (!v) return;
+      v.dispatch({
+        effects: compsRef.current.theme.reconfigure(
+          themeExtension(getCurrentTheme()),
+        ),
       });
     }
     window.addEventListener(THEME_CHANGE_EVENT, onThemeChange);
@@ -134,24 +153,100 @@ export function Workspace() {
       view.destroy();
       viewRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const onLanguageChange = useCallback((next: Language) => {
+  const swapTo = useCallback((nextId: TabId, nextFilename: string) => {
     const view = viewRef.current;
-    if (!view) {
-      setLanguage(next);
-      return;
+    if (!view) return;
+
+    // Save current state into the leaving tab
+    const leavingId = activeIdRef.current;
+    if (leavingId && leavingId !== nextId) {
+      statesRef.current.set(leavingId, view.state);
     }
-    view.dispatch({
-      effects: languageCompartment.current.reconfigure(languageExtension(next)),
-      changes: {
-        from: 0,
-        to: view.state.doc.length,
-        insert: STARTER_DOCS[next],
-      },
-    });
-    setLanguage(next);
+
+    const theme = getCurrentTheme();
+    let next = statesRef.current.get(nextId);
+    if (!next) {
+      next = createTabState("", nextFilename, theme, compsRef.current);
+      statesRef.current.set(nextId, next);
+    } else {
+      next = reconcileThemeOnState(next, compsRef.current, theme);
+    }
+
+    view.setState(next);
+    view.focus();
   }, []);
+
+  const activate = useCallback(
+    (id: TabId) => {
+      if (id === activeIdRef.current) {
+        viewRef.current?.focus();
+        return;
+      }
+      const tab = tabs.find((t) => t.id === id);
+      if (!tab) return;
+      swapTo(id, tab.name);
+      setActiveId(id);
+    },
+    [tabs, swapTo],
+  );
+
+  const createTab = useCallback(() => {
+    setTabs((prev) => {
+      if (prev.length >= MAX_TABS) return prev;
+      const name = defaultFilenameForNewTab(prev);
+      const id = newTabId();
+      swapTo(id, name);
+      setActiveId(id);
+      return [...prev, { id, name }];
+    });
+  }, [swapTo]);
+
+  const closeTab = useCallback(
+    (id: TabId) => {
+      setTabs((prev) => {
+        if (prev.length <= 1) return prev;
+        const idx = prev.findIndex((t) => t.id === id);
+        if (idx < 0) return prev;
+        const next = prev.filter((t) => t.id !== id);
+        statesRef.current.delete(id);
+
+        if (id === activeIdRef.current) {
+          const neighborIdx = Math.min(idx, next.length - 1);
+          const neighbor = next[neighborIdx];
+          swapTo(neighbor.id, neighbor.name);
+          setActiveId(neighbor.id);
+        }
+        return next;
+      });
+    },
+    [swapTo],
+  );
+
+  const renameTab = useCallback(
+    (id: TabId, name: string): boolean => {
+      if (!isValidFilename(name)) return false;
+      const trimmed = name.trim();
+      let ok = true;
+      setTabs((prev) => {
+        if (prev.some((t) => t.id !== id && t.name === trimmed)) {
+          ok = false;
+          return prev;
+        }
+        return prev.map((t) => (t.id === id ? { ...t, name: trimmed } : t));
+      });
+      if (ok && id === activeIdRef.current && viewRef.current) {
+        const lang = languageExtensionFor(trimmed);
+        viewRef.current.dispatch({
+          effects: compsRef.current.language.reconfigure(lang ?? []),
+        });
+      }
+      return ok;
+    },
+    [],
+  );
 
   return (
     <div className="flex flex-col h-[calc(100vh-4rem)]">
@@ -163,20 +258,11 @@ export function Workspace() {
             className="font-mono text-foreground/80 bg-transparent border border-transparent hover:border-black/10 dark:hover:border-white/10 focus:border-black/20 dark:focus:border-white/20 rounded px-2 py-1 outline-none transition-colors min-w-0 w-64"
             aria-label="Session name"
           />
+          <span className="text-foreground/40 text-xs font-mono">
+            {tabs.length} {tabs.length === 1 ? "file" : "files"}
+          </span>
         </div>
         <div className="flex items-center gap-2">
-          <select
-            value={language}
-            onChange={(e) => onLanguageChange(e.target.value as Language)}
-            className="h-8 rounded-md border border-black/10 dark:border-white/15 bg-transparent px-2 text-xs text-foreground/80 hover:bg-black/5 dark:hover:bg-white/5 transition-colors cursor-pointer"
-            aria-label="Language"
-          >
-            {LANGUAGES.map((l) => (
-              <option key={l.value} value={l.value} className="bg-background">
-                {l.label}
-              </option>
-            ))}
-          </select>
           <button
             type="button"
             disabled
@@ -204,6 +290,16 @@ export function Workspace() {
           </button>
         </div>
       </div>
+
+      <TabStrip
+        tabs={tabs}
+        activeId={activeId}
+        onActivate={activate}
+        onClose={closeTab}
+        onRename={renameTab}
+        onNew={createTab}
+      />
+
       <div
         ref={hostRef}
         className="flex-1 min-h-0 overflow-hidden bg-background"
