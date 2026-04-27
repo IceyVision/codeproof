@@ -9,6 +9,7 @@ import {
   highlightActiveLine,
   highlightActiveLineGutter,
   drawSelection,
+  type ViewUpdate,
 } from "@codemirror/view";
 import {
   defaultKeymap,
@@ -60,11 +61,15 @@ function themeExtension(theme: Theme): Extension {
 
 type Compartments = { theme: Compartment; language: Compartment };
 
+const WS_URL =
+  process.env.NEXT_PUBLIC_BACKEND_WS ?? "ws://localhost:8080/ws";
+
 function createTabState(
   doc: string,
   filename: string,
   theme: Theme,
   comps: Compartments,
+  onUpdate: (u: ViewUpdate) => void,
 ): EditorState {
   const lang = languageExtensionFor(filename);
   return EditorState.create({
@@ -88,6 +93,7 @@ function createTabState(
       comps.language.of(lang ?? []),
       comps.theme.of(themeExtension(theme)),
       EditorView.lineWrapping,
+      EditorView.updateListener.of(onUpdate),
     ],
   });
 }
@@ -112,6 +118,21 @@ export function Workspace() {
   });
   const statesRef = useRef<Map<TabId, EditorState>>(new Map());
   const activeIdRef = useRef<TabId | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  const sendEdit = useCallback((u: ViewUpdate) => {
+    if (!u.docChanged || u.transactions.length === 0) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(
+      JSON.stringify({
+        type: "edit",
+        tabId: activeIdRef.current,
+        ts: Date.now(),
+        changes: u.changes.toJSON(),
+      }),
+    );
+  }, []);
 
   const [tabs, setTabs] = useState<TabMeta[]>(() => [
     { id: newTabId(), name: "main.js" },
@@ -131,11 +152,26 @@ export function Workspace() {
 
     const firstTab = tabs[0];
     const theme = getCurrentTheme();
-    const state = createTabState(STARTER_DOC, firstTab.name, theme, compsRef.current);
+    const state = createTabState(
+      STARTER_DOC,
+      firstTab.name,
+      theme,
+      compsRef.current,
+      sendEdit,
+    );
     statesRef.current.set(firstTab.id, state);
 
     const view = new EditorView({ state, parent: hostRef.current });
     viewRef.current = view;
+
+    const ws = new WebSocket(WS_URL);
+    wsRef.current = ws;
+    ws.addEventListener("open", () => console.log("[ws] connected to", WS_URL));
+    ws.addEventListener("close", (e) =>
+      console.log("[ws] closed", e.code, e.reason || ""),
+    );
+    ws.addEventListener("error", () => console.warn("[ws] error"));
+    ws.addEventListener("message", (e) => console.log("[ws] <-", e.data));
 
     function onThemeChange() {
       const v = viewRef.current;
@@ -152,32 +188,42 @@ export function Workspace() {
       window.removeEventListener(THEME_CHANGE_EVENT, onThemeChange);
       view.destroy();
       viewRef.current = null;
+      ws.close();
+      wsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const swapTo = useCallback((nextId: TabId, nextFilename: string) => {
-    const view = viewRef.current;
-    if (!view) return;
+  const swapTo = useCallback(
+    (nextId: TabId, nextFilename: string) => {
+      const view = viewRef.current;
+      if (!view) return;
 
-    // Save current state into the leaving tab
-    const leavingId = activeIdRef.current;
-    if (leavingId && leavingId !== nextId) {
-      statesRef.current.set(leavingId, view.state);
-    }
+      const leavingId = activeIdRef.current;
+      if (leavingId && leavingId !== nextId) {
+        statesRef.current.set(leavingId, view.state);
+      }
 
-    const theme = getCurrentTheme();
-    let next = statesRef.current.get(nextId);
-    if (!next) {
-      next = createTabState("", nextFilename, theme, compsRef.current);
-      statesRef.current.set(nextId, next);
-    } else {
-      next = reconcileThemeOnState(next, compsRef.current, theme);
-    }
+      const theme = getCurrentTheme();
+      let next = statesRef.current.get(nextId);
+      if (!next) {
+        next = createTabState(
+          "",
+          nextFilename,
+          theme,
+          compsRef.current,
+          sendEdit,
+        );
+        statesRef.current.set(nextId, next);
+      } else {
+        next = reconcileThemeOnState(next, compsRef.current, theme);
+      }
 
-    view.setState(next);
-    view.focus();
-  }, []);
+      view.setState(next);
+      view.focus();
+    },
+    [sendEdit],
+  );
 
   const activate = useCallback(
     (id: TabId) => {
